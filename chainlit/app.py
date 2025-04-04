@@ -1,67 +1,96 @@
 import os
 from dotenv import load_dotenv
-
-from utilities import get_similar_sessions
-
-from langchain_openai import AzureChatOpenAI
+import chainlit as cl
+from langchain_openai import ChatOpenAI, AzureChatOpenAI
 from langchain.prompts import ChatPromptTemplate
 from langchain.schema import StrOutputParser
-from langchain.schema.runnable import Runnable
-from langchain.schema.runnable.config import RunnableConfig
-from langchain_core.runnables import RunnableLambda, RunnablePassthrough
-
-import chainlit as cl
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import json
 
 load_dotenv()
 
+# Database connection
+def get_db_connection():
+    return psycopg2.connect(
+        host=os.getenv("DB_HOST"),
+        database=os.getenv("DB_NAME"),
+        user=os.getenv("DB_USER"),
+        password=os.getenv("DB_PASSWORD"),
+        port=os.getenv("DB_PORT", "5432")
+    )
+
 @cl.on_chat_start
 async def on_chat_start():
-    openai = AzureChatOpenAI(
-        openai_api_version=os.environ["AZURE_OPENAI_API_VERSION"],
-        azure_deployment=os.environ["AZURE_OPENAI_CHAT_DEPLOYMENT_NAME"],
-        streaming=True
-    )
-    prompt = ChatPromptTemplate.from_messages(
-        [
-            (
-                "ai",
-                """ 
-                You are a system assistant who helps users find the right session to watch from the conference, based off the sessions that are provided to you.
-                Sessions will be provided in an assistant message in the format of `title|abstract|speakers|start-time|end-time`. You can use only the provided session list to help you answer the user's question.
-                If the user ask a question that is not related to the provided sessions, you can respond with a message that you can't help with that question.
-                Your aswer must have the session title, a very short summary of the abstract, the speakers, the start time, and the end time.
-                """,
-            ),
-            (
-                "human",
-                """
-                The sessions available at the conference are the following: 
-                {sessions}                
-                """
-            ),
-            (
-                "human",                
-                "{question}"
-            ),
-        ]
-    )
-
-    # Use an agent retriever to get similar sessions
-    retriever = RunnableLambda(get_similar_sessions, name="GetSimilarSessions").bind() 
-
-    runnable = {"sessions": retriever, "question": RunnablePassthrough()} | prompt | openai | StrOutputParser()
-    cl.user_session.set("runnable", runnable)    
+    # Initialize the LLM based on configuration
+    if os.getenv("AZURE_OPENAI_ENDPOINT"):
+        # Use Azure OpenAI
+        llm = AzureChatOpenAI(
+            openai_api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-01"),
+            azure_deployment=os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT_NAME", "gpt-4"),
+            azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+            api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+            temperature=0
+        )
+    else:
+        # Use direct OpenAI
+        llm = ChatOpenAI(
+            model="gpt-4",
+            temperature=0
+        )
+    
+    # Create a prompt template for SQL generation
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", """You are a SQL expert. Given a natural language question, generate a SQL query.
+        The database is a PostgreSQL database. Generate only valid PostgreSQL SQL queries.
+        Only return the SQL query, nothing else. Do not include any explanations or markdown formatting.
+        Make sure to use proper table and column names as they exist in the database.
+        If you're not sure about the exact table or column names, use common SQL naming conventions.
+        """),
+        ("human", "{question}")
+    ])
+    
+    chain = prompt | llm | StrOutputParser()
+    cl.user_session.set("chain", chain)
 
 @cl.on_message
 async def on_message(message: cl.Message):
-    runnable = cl.user_session.get("runnable")  # type: Runnable
+    chain = cl.user_session.get("chain")
     
-    response_message = cl.Message(content="")
-
-    for chunk in await cl.make_async(runnable.stream)(
-        input=message.content,
-        config=RunnableConfig(callbacks=[cl.LangchainCallbackHandler()]),
-    ):
-        await response_message.stream_token(chunk)
-
-    await response_message.send()
+    # Get the SQL query
+    sql_query = await chain.ainvoke({
+        "question": message.content
+    })
+    
+    # Execute the query
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute(sql_query)
+        results = cur.fetchall()
+        
+        # Format results as a table
+        if results:
+            # Get column names
+            columns = results[0].keys()
+            
+            # Create table header
+            table = "| " + " | ".join(columns) + " |\n"
+            table += "| " + " | ".join(["---"] * len(columns)) + " |\n"
+            
+            # Add rows
+            for row in results:
+                table += "| " + " | ".join(str(row[col]) for col in columns) + " |\n"
+            
+            response = f"**SQL Query:**\n```sql\n{sql_query}\n```\n\n**Results:**\n{table}"
+        else:
+            response = f"**SQL Query:**\n```sql\n{sql_query}\n```\n\nNo results found."
+        
+        await cl.Message(content=response).send()
+        
+    except Exception as e:
+        error_msg = f"Error executing query: {str(e)}"
+        await cl.Message(content=error_msg).send()
+    finally:
+        if 'conn' in locals():
+            conn.close()
